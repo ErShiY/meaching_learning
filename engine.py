@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 
 def set_seed(seed):
@@ -61,7 +62,18 @@ def calculate_f1(logits, targets, threshold):
     return macro_f1, micro_f1
 
 
-def run_epoch(model, data_loader, criterion, device, threshold, optimizer=None):
+def run_epoch(
+    model,
+    data_loader,
+    criterion,
+    device,
+    threshold,
+    optimizer=None,
+    progress_desc=None,
+    scheduler=None,
+    global_step_start=0,
+    collect_outputs=False,
+):
     is_training = optimizer is not None
     if is_training:
         model.train()
@@ -70,14 +82,28 @@ def run_epoch(model, data_loader, criterion, device, threshold, optimizer=None):
 
     total_loss = 0.0
     total_samples = 0
+    all_ids = []
     all_logits = []
     all_targets = []
 
-    for batch in data_loader:
+    if progress_desc is None:
+        progress_desc = "Train" if is_training else "Evaluate"
+
+    progress_bar = tqdm(
+        data_loader,
+        desc=progress_desc,
+        total=len(data_loader),
+        unit="batch",
+        dynamic_ncols=True,
+    )
+
+    for batch_index, batch in enumerate(progress_bar):
         images = batch["image"].to(device, non_blocking=True)
         targets = batch["target"].to(device, non_blocking=True)
 
         if is_training:
+            if scheduler is not None:
+                scheduler.set_learning_rate(global_step_start + batch_index)
             optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(is_training):
@@ -93,6 +119,19 @@ def run_epoch(model, data_loader, criterion, device, threshold, optimizer=None):
         total_samples += batch_size
         all_logits.append(logits.detach().cpu())
         all_targets.append(targets.detach().cpu())
+        if collect_outputs:
+            all_ids.extend(batch["id"])
+
+        progress_metrics = {
+            "loss": f"{loss.item():.4f}",
+            "avg_loss": f"{total_loss / total_samples:.4f}",
+        }
+        if is_training:
+            progress_metrics["lr"] = f"{optimizer.param_groups[0]['lr']:.2e}"
+        if device.type == "cuda":
+            gpu_memory_gb = torch.cuda.memory_allocated(device) / (1024**3)
+            progress_metrics["gpu_mem"] = f"{gpu_memory_gb:.1f}G"
+        progress_bar.set_postfix(progress_metrics)
 
     if total_samples == 0:
         raise ValueError("Cannot run an epoch with an empty data loader.")
@@ -103,11 +142,16 @@ def run_epoch(model, data_loader, criterion, device, threshold, optimizer=None):
         all_logits, all_targets, threshold
     )
 
-    return {
+    metrics = {
         "loss": total_loss / total_samples,
         "macro_f1": macro_f1,
         "micro_f1": micro_f1,
     }
+    if collect_outputs:
+        metrics["predictions"] = (
+            np.asarray(all_ids), all_targets.numpy(), torch.sigmoid(all_logits).numpy(),
+        )
+    return metrics
 
 
 def save_training_log(log_path, history_rows):
@@ -122,13 +166,25 @@ def save_training_log(log_path, history_rows):
 
 
 @torch.no_grad()
-def collect_predictions(model, data_loader, device):
+def collect_predictions(
+    model,
+    data_loader,
+    device,
+    progress_desc="Validation reports",
+):
     model.eval()
     all_ids = []
     all_targets = []
     all_probabilities = []
 
-    for batch in data_loader:
+    progress_bar = tqdm(
+        data_loader,
+        desc=progress_desc,
+        total=len(data_loader),
+        unit="batch",
+        dynamic_ncols=True,
+    )
+    for batch in progress_bar:
         images = batch["image"].to(device, non_blocking=True)
         logits = model(images)
         probabilities = torch.sigmoid(logits)
@@ -193,6 +249,11 @@ def save_validation_artifacts(
     threshold,
     output_dir,
 ):
+    predictions = collect_predictions(model, val_loader, device)
+    save_prediction_artifacts(predictions, threshold, output_dir)
+
+
+def save_prediction_artifacts(predictions, threshold, output_dir, split="validation"):
     import matplotlib
 
     matplotlib.use("Agg")
@@ -201,13 +262,12 @@ def save_validation_artifacts(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    image_ids, targets, probabilities = collect_predictions(
-        model, val_loader, device
-    )
+    image_ids, targets, probabilities = predictions
     metrics = calculate_per_class_metrics(targets, probabilities, threshold)
 
+    prediction_prefix = "val" if split == "validation" else split
     np.savez_compressed(
-        output_dir / "val_predictions.npz",
+        output_dir / f"{prediction_prefix}_predictions.npz",
         ids=image_ids,
         targets=targets.astype(np.uint8),
         probabilities=probabilities.astype(np.float32),
@@ -292,7 +352,7 @@ def save_validation_artifacts(
         axis.axis("off")
 
     figure.suptitle(
-        f"Validation one-vs-rest confusion matrices (threshold={threshold:.3f})",
+        f"{split.capitalize()} one-vs-rest confusion matrices (threshold={threshold:.3f})",
         fontsize=15,
     )
     figure.tight_layout(rect=(0, 0, 1, 0.97))
@@ -303,7 +363,7 @@ def save_validation_artifacts(
     )
     plt.close(figure)
 
-    print(f"Validation reports saved to: {output_dir}")
+    print(f"{split.capitalize()} reports saved to: {output_dir}")
 
 
 def run_smoke_test(
@@ -313,6 +373,8 @@ def run_smoke_test(
     criterion,
     optimizer,
     device,
+    scheduler=None,
+    eval_label="Val",
 ):
     print("Running one-batch smoke test...")
 
@@ -321,6 +383,8 @@ def run_smoke_test(
     train_images = train_batch["image"].to(device)
     train_targets = train_batch["target"].to(device)
 
+    if scheduler is not None:
+        scheduler.set_learning_rate(0)
     optimizer.zero_grad(set_to_none=True)
     train_logits = model(train_images)
     train_loss = criterion(train_logits, train_targets)
@@ -338,5 +402,5 @@ def run_smoke_test(
     print(f"Train image shape: {tuple(train_images.shape)}")
     print(f"Train logits shape: {tuple(train_logits.shape)}")
     print(f"Train loss: {train_loss.item():.4f}")
-    print(f"Val loss: {val_loss.item():.4f}")
+    print(f"{eval_label} loss: {val_loss.item():.4f}")
     print("Smoke test passed: data, forward, loss and backward are working.")
